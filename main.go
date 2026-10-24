@@ -1,7 +1,7 @@
 // autocorrect: reads one word per line on stdin, writes one corrected word per line.
 //
 // Method (no machine learning, fully deterministic):
-//  1. A word found in the lexicon (SCOWL lists) is returned unchanged.
+//  1. A word found in the lexicon (SCOWL lists, incl. abbreviations) is returned unchanged.
 //  2. Otherwise every lexicon word is scored with a hand-written weighted edit
 //     distance (keyboard, phonetic and doubled-letter rules) plus a frequency
 //     prior, via a depth-first walk over a trie with branch-and-bound pruning.
@@ -55,6 +55,7 @@ var (
 	prior []int32
 	phon  []string // phonetic key of each word
 	trie  []node
+	abbr  = map[string]bool{} // kept when typed, never offered as a correction
 )
 
 func load() {
@@ -71,6 +72,10 @@ func load() {
 		}
 		lv, _ := strconv.Atoi(f[1])
 		if lv > maxLevel {
+			continue
+		}
+		if f[3] == "a" {
+			abbr[f[0]] = true
 			continue
 		}
 		c, _ := strconv.ParseFloat(f[2], 64)
@@ -420,7 +425,7 @@ func min32(a, b int32) int32 {
 }
 
 func (s *searcher) correct(w string) string {
-	if lookup(w) || len(w) >= maxDepth {
+	if lookup(w) || abbr[w] || len(w) >= maxDepth {
 		return w
 	}
 	t := []byte(w)

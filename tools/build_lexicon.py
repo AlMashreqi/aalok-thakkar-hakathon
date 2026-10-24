@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Build data/lexicon.tsv (word, scowl_level, google_count, w=word|n=name only) from SCOWL + Norvig count_1w.
+"""Build data/lexicon.tsv (word, scowl_level, google_count, w=word|n=name only|a=abbreviation)
+from SCOWL + Norvig count_1w. Abbreviation rows (a) are kept when typed but never
+offered as corrections.
 
 SCOWL decides what is a word; count_1w only supplies frequencies (it also contains
 common misspellings, so it is never used to decide validity)."""
@@ -9,9 +11,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW = os.path.join(ROOT, "data", "raw")
 FINAL = os.path.join(RAW, "scowl-2020.12.07", "final")
 VALID = re.compile(r"^[a-z]+(?:'[a-z]+)*$")
-# word lists (no abbreviations: lowercased acronyms would shadow real corrections)
 KINDS = ("words", "upper", "proper-names", "contractions")
-SPELLINGS = ("english", "american", "british", "canadian")
+# abbreviation lists: only entries written in lowercase (etc, approx), not acronyms
+ABBR_KINDS = ("abbreviations", "hacker")
+SPELLINGS = ("english", "american", "british", "canadian", "special")
 
 
 def ascii_fold(s):
@@ -20,17 +23,23 @@ def ascii_fold(s):
 
 
 level = {}
+abbr = {}  # abbreviation -> lowest SCOWL level
 common = set()  # found in a lowercase word list, not only as a name
 for name in sorted(os.listdir(FINAL)):
     m = re.match(r"^([a-z_]+)-([a-z-]+)\.(\d+)$", name)
-    if not m or m.group(1) not in SPELLINGS or m.group(2) not in KINDS:
+    if not m or m.group(1) not in SPELLINGS or m.group(2) not in KINDS + ABBR_KINDS:
         continue
     lv = int(m.group(3))
     is_name = m.group(2) in ("upper", "proper-names")
     with open(os.path.join(FINAL, name), encoding="latin-1") as f:
         for line in f:
-            w = ascii_fold(line.strip())
+            raw = line.strip()
+            w = ascii_fold(raw)
             if not VALID.match(w):
+                continue
+            if m.group(2) in ABBR_KINDS:
+                if raw[:1].islower() and lv < abbr.get(w, 999):
+                    abbr[w] = lv
                 continue
             if w not in level or lv < level[w]:
                 level[w] = lv
@@ -49,4 +58,6 @@ with open(out, "w") as f:
         # count_1w was tokenized without apostrophes, so "don't" is counted as "dont"
         c = count.get(w) or count.get(w.replace("'", ""), 0)
         f.write(f"{w}\t{level[w]}\t{c}\t{'w' if w in common else 'n'}\n")
+    for w in sorted(abbr):
+        f.write(f"{w}\t{abbr[w]}\t0\ta\n")
 print(f"wrote {len(level)} words to {out}", file=sys.stderr)

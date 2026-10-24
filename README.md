@@ -20,7 +20,9 @@ The lexicon is embedded in the binary, so it needs no files at runtime.
 1. **Lexicon.** SCOWL word lists up to size level 70 (165,436 words incl. names and
    contractions, accents folded to ASCII). A word found here is returned unchanged.
    Levels 80+ are excluded because they contain common misspellings (e.g. SCOWL 80
-   lists "expresso").
+   lists "expresso"). SCOWL's lowercase abbreviations and hacker jargon (etc, approx,
+   blvd, grep) are also kept when typed, but are never offered as corrections, so
+   short misspellings are not pulled toward them.
 2. **Prior.** `prior = 9.0 * ln(maxCount / count)` in hundredths of an edit, with
    counts from Norvig's Google Web unigram list. That list contains misspellings too,
    so it only supplies frequencies, never decides what is a word. Contractions
@@ -62,8 +64,11 @@ override them for tuning runs only.
 
 ## Evaluation
 
-The public development set was not available to us. We evaluated on local sets
-built by `tools/make_eval.py` from the Birkbeck corpus. Pairs are split by a hash
+**Development set** (2,000 words), scored with the organisers' `score.py`:
+A = 0.9175 (correct 99.75%, human 88.83%, keyboard 92.50%), T = 0.36 s
+(10 cores; 1.38 s with GOMAXPROCS=1), peak memory 78 MB, on an Apple M-series Mac.
+
+We also evaluated on local sets built by `tools/make_eval.py` from the Birkbeck corpus. Pairs are split by a hash
 of the correct word into **tune** (used to choose the few constants) and
 **holdout** (never tuned on). Correctly spelled words are mixed in, and synthetic
 single keyboard slips are added. `python3 tools/score.py eval/holdout.tsv` reproduces
@@ -71,11 +76,11 @@ these numbers.
 
 | Set | tune | holdout |
 |---|---:|---:|
-| Wikipedia misspellings | 83.0% | 85.7% |
-| Aspell misspellings | 63.7% | 65.7% |
-| Keyboard slips (synthetic) | 89.8% | 88.5% |
+| Wikipedia misspellings | 82.8% | 85.6% |
+| Aspell misspellings | 63.2% | 65.7% |
+| Keyboard slips (synthetic) | 89.7% | 88.5% |
 | Correct words kept | 100% / 99.7% | 100% / 99.6% |
-| Birkbeck children's errors (missp) | 44.9% | 42.6% |
+| Birkbeck children's errors (missp) | 44.8% | 42.4% |
 
 The few scalar constants were chosen on the tune split. Holdout scores match tune scores, which suggests the
 constants generalize. No rule refers to a specific word.
@@ -84,5 +89,3 @@ Time: about 0.2 s startup, then about 1 ms of CPU per misspelled word. Example
 workload: 10,000 distinct misspellings of common words (one random edit each).
 That takes 1.5 s with 10 cores and 7.4 s with GOMAXPROCS=1, on an Apple M-series
 Mac under macOS. Peak memory is about 85 MB.
-
-Development set (fill in when run): A = ___, T = ___ s.
