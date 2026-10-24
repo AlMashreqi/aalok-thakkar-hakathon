@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Build data/lexicon.tsv (word, scowl_level, google_count, w=word|n=name only|a=abbreviation)
-from SCOWL + Norvig count_1w. Abbreviation rows (a) are kept when typed but never
-offered as corrections.
+"""Build data/lexicon.tsv (word, scowl_level, count, w=word|n=name only|a=abbreviation)
+from SCOWL + wordfreq. Abbreviation rows (a) are kept when typed but never
+offered as corrections. Only SCOWL levels <= 70 are written (the program uses no more).
 
-SCOWL decides what is a word; count_1w only supplies frequencies (it also contains
-common misspellings, so it is never used to decide validity)."""
-import os, re, sys, unicodedata
+SCOWL decides what is a word; wordfreq only supplies how common it is.
+Needs: pip install msgpack, and tools/fetch_data.sh run first."""
+import gzip, os, re, sys, unicodedata
+
+import msgpack
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW = os.path.join(ROOT, "data", "raw")
 FINAL = os.path.join(RAW, "scowl-2020.12.07", "final")
+MAX_LEVEL = 70
+# wordfreq stores frequencies in centibel buckets; scale them to whole counts
+WORDFREQ = os.path.join(RAW, "wordfreq-3.1.1", "large_en.msgpack.gz")
+COUNT_SCALE = 5.88e11
 VALID = re.compile(r"^[a-z]+(?:'[a-z]+)*$")
 KINDS = ("words", "upper", "proper-names", "contractions")
 # abbreviation lists: only entries written in lowercase (etc, approx), not acronyms
@@ -46,18 +52,21 @@ for name in sorted(os.listdir(FINAL)):
             if not is_name:
                 common.add(w)
 
-count = {}
-with open(os.path.join(RAW, "count_1w.txt")) as f:
-    for line in f:
-        w, c = line.split("\t")
-        count[w] = int(c)
+# bucket i holds words with frequency 10^(-i/100); a word's first bucket wins
+freq = {}
+with gzip.open(WORDFREQ) as f:
+    buckets = msgpack.load(f, raw=False)
+for i, bucket in enumerate(buckets[1:], 1):
+    for w in bucket:
+        freq.setdefault(w, 10 ** (-i / 100))
 
 out = os.path.join(ROOT, "data", "lexicon.tsv")
 with open(out, "w") as f:
     for w in sorted(level):
-        # count_1w was tokenized without apostrophes, so "don't" is counted as "dont"
-        c = count.get(w) or count.get(w.replace("'", ""), 0)
-        f.write(f"{w}\t{level[w]}\t{c}\t{'w' if w in common else 'n'}\n")
+        if level[w] <= MAX_LEVEL:
+            c = round(freq[w] * COUNT_SCALE) if w in freq else 0
+            f.write(f"{w}\t{level[w]}\t{c}\t{'w' if w in common else 'n'}\n")
     for w in sorted(abbr):
-        f.write(f"{w}\t{abbr[w]}\t0\ta\n")
-print(f"wrote {len(level)} words to {out}", file=sys.stderr)
+        if abbr[w] <= MAX_LEVEL:
+            f.write(f"{w}\t{abbr[w]}\t0\ta\n")
+print(f"wrote {out}", file=sys.stderr)

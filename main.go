@@ -4,7 +4,8 @@
 //  1. A word found in the lexicon (SCOWL lists, incl. abbreviations) is returned unchanged.
 //  2. Otherwise every lexicon word is scored with a hand-written weighted edit
 //     distance (keyboard, phonetic and doubled-letter rules) plus a frequency
-//     prior, via a depth-first walk over a trie with branch-and-bound pruning.
+//     prior and a small penalty beyond one ordinary edit, minus bonuses when it
+//     sounds like the input, via an exact branch-and-bound trie search.
 //  3. The cheapest candidate wins; if none is within the bound the word is kept.
 package main
 
@@ -15,6 +16,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,13 +29,19 @@ var lexiconTSV string
 // Tunable constants (costs are in hundredths of one plain edit).
 // Each can be overridden by an AC_<NAME> environment variable for tuning runs.
 var (
-	maxLevel   = envInt("MAXLEVEL", 70)          // SCOWL size level accepted as a real word
-	priorScale = envInt("PRIORSCALE", 90)        // cost per 10 natural-log units of frequency ratio
-	zeroCount  = envInt("ZEROCOUNT", 5000)       // assumed count for lexicon words absent from count_1w
-	maxEdit    = int32(envInt("MAXEDIT", 260))   // search bound on edit cost
-	firstExtra = int32(envInt("FIRST", 50))      // extra cost for an edit touching the first letter
-	firstPass  = int32(envInt("FIRSTPASS", 140)) // edit bound of the quick first search pass
-	phoneBonus = int32(envInt("PHONE", 30))      // discount for a candidate that sounds like the input
+	maxLevel    = envInt("MAXLEVEL", 70)          // SCOWL size level accepted as a real word
+	priorScale  = envInt("PRIORSCALE", 75)        // cost per 10 natural-log units of frequency ratio
+	zeroCount   = envInt("ZEROCOUNT", 500)        // fallback in the embedded wordfreq count units
+	maxEdit     = int32(envInt("MAXEDIT", 260))   // search bound on edit cost
+	firstExtra  = int32(envInt("FIRST", 50))      // extra cost for an edit touching the first letter
+	firstPass   = int32(envInt("FIRSTPASS", 140)) // edit bound of the quick first search pass
+	phoneBonus  = int32(envInt("PHONE", 15))      // discount for a candidate that sounds like the input
+	soundBonus  = int32(envInt("SOUND", 50))      // extra discount when vowel sounds match too (soundKey)
+	clusterCost = int32(envInt("CLUSTER", 40))    // dropping a weak consonant (n/m/r/l) from a cluster; 0 = off
+	aposCost    = int32(envInt("APOS", 60))       // cost of a missing or extra apostrophe
+	namePen     = int32(envInt("NAMEPEN", 80))    // extra prior for words SCOWL lists only as names
+	levelPen    = int32(envInt("LEVELPEN", 120))  // extra prior per 100 SCOWL levels (rarer word lists)
+	multiPen    = int32(envInt("MULTI", 60))      // extra cost for candidates beyond one ordinary edit
 )
 
 func envInt(name string, def int) int {
@@ -54,15 +62,20 @@ var (
 	words []string
 	prior []int32
 	phon  []string // phonetic key of each word
-	trie  []node
-	abbr  = map[string]bool{} // kept when typed, never offered as a correction
+	snd   []string // vowel-aware sound key of each word
+	// words by phonetic / sound key, so bonus candidates can be scored directly
+	byPhon, bySnd map[string][]int32
+	trie          []node
+	abbr          = map[string]bool{} // kept when typed, never offered as a correction
 )
 
 func load() {
 	maxCount := 0.0
 	type entry struct {
-		w string
-		c float64
+		w    string
+		c    float64
+		lv   int32
+		name bool
 	}
 	var es []entry
 	for line := range strings.SplitSeq(lexiconTSV, "\n") {
@@ -83,7 +96,7 @@ func load() {
 			c = float64(zeroCount)
 		}
 		maxCount = math.Max(maxCount, c)
-		es = append(es, entry{f[0], c})
+		es = append(es, entry{f[0], c, int32(lv), f[3] == "n"})
 	}
 	trie = append(trie, node{word: -1, first: -1, next: -1, minPrior: math.MaxInt32})
 	for _, e := range es {
@@ -93,10 +106,45 @@ func load() {
 		}
 		trie[n].word = int32(len(words))
 		words = append(words, e.w)
-		prior = append(prior, int32(math.Round(float64(priorScale)/10*(math.Log(maxCount)-math.Log(e.c)))))
-		phon = append(phon, phonKey(e.w))
+		p := int32(math.Round(float64(priorScale) / 10 * (math.Log(maxCount) - math.Log(e.c))))
+		p += levelPen * e.lv / 100
+		if e.name {
+			p += namePen
+		}
+		prior = append(prior, p)
+	}
+	// phonetic keys are independent per word: compute them on all cores
+	phon, snd = make([]string, len(words)), make([]string, len(words))
+	var wg sync.WaitGroup
+	chunk := (len(words) + runtime.NumCPU() - 1) / runtime.NumCPU()
+	for lo := 0; lo < len(words); lo += chunk {
+		hi := min(lo+chunk, len(words))
+		wg.Go(func() {
+			for i := lo; i < hi; i++ {
+				phon[i], snd[i] = phonKey(words[i]), soundKey(words[i])
+			}
+		})
 	}
 	setMinPrior(0)
+	wg.Wait()
+	buildKeyIndex()
+}
+
+// buildKeyIndex fills byPhon and bySnd from phon and snd.
+func buildKeyIndex() {
+	byPhon, bySnd = map[string][]int32{}, map[string][]int32{}
+	var wg sync.WaitGroup
+	for _, x := range []struct {
+		m    map[string][]int32
+		keys []string
+	}{{byPhon, phon}, {bySnd, snd}} {
+		wg.Go(func() {
+			for i, k := range x.keys {
+				x.m[k] = append(x.m[k], int32(i))
+			}
+		})
+	}
+	wg.Wait()
 }
 
 func setMinPrior(n int32) int32 {
@@ -108,6 +156,9 @@ func setMinPrior(n int32) int32 {
 		m = min32(m, setMinPrior(c))
 	}
 	trie[n].minPrior = m
+	if first := trie[n].first; first < 0 || trie[first].next < 0 {
+		return m // no allocation or sorting for a leaf or a single child
+	}
 	// visit frequent subtrees first so a good candidate tightens the bound early
 	var kids []int32
 	for c := trie[n].first; c >= 0; c = trie[c].next {
@@ -167,11 +218,13 @@ var kbRows = []string{"qwertyuiop", "asdfghjkl", "zxcvbnm"}
 
 // sub[a][b]: cost of the intended letter a being typed as b.
 var sub [256][256]int32
+var near [256][256]bool // keyboard geometry is independent of phonetic substitution costs
 
 // rule: the dictionary spelling dict was written as typo (sound-alike graphemes).
 type rule struct {
 	typo, dict string
 	cost       int32
+	dk, mask   uint64 // dict side packed 5 bits per letter (last letter lowest), and its mask
 }
 
 var (
@@ -194,6 +247,7 @@ func init() {
 					dx := float64(i2) + 0.5*float64(r2) - float64(i) - 0.5*float64(r)
 					if (r != r2 || i != i2) && abs(r-r2) <= 1 && math.Abs(dx) <= 1 {
 						sub[row[i]][row2[i2]] = 75
+						near[row[i]][row2[i2]] = true
 					}
 				}
 			}
@@ -231,9 +285,38 @@ func init() {
 		{"eigh", "ay", 50}, {"eigh", "a", 60}, {"igh", "y", 50}, {"bt", "t", 50}, {"ea", "ee", 40}, {"ie", "y", 50},
 		{"ie", "ei", 35}, {"ys", "ies", 40}, {"ure", "er", 50}, {"ough", "u", 50}, {"ough", "o", 60}, {"ough", "off", 60}, {"ough", "uff", 60}, {"augh", "aff", 60}, {"igh", "i", 60},
 	}
+	// weak consonants left out of clusters, a well-known pattern in human spelling
+	// (Treiman 1993): nasals before a consonant (angina -> agina), r/l after a vowel
+	// before a consonant (field -> fied), r/l after a consonant (scrub -> scub).
+	// One direction only: the dictionary has the cluster, the typo lacks the letter.
+	if clusterCost > 0 {
+		const cons = "bcdfghjklmnpqrstvwxz"
+		for _, c := range cons {
+			for _, w := range "nm" {
+				if c != w {
+					rules = append(rules, rule{string(c), string(w) + string(c), clusterCost, 0, 0})
+				}
+			}
+			for _, w := range "rl" {
+				if c != w {
+					rules = append(rules, rule{string(c), string(c) + string(w), clusterCost, 0, 0})
+					for _, v := range "aeiou" {
+						rules = append(rules, rule{string(v) + string(c), string(v) + string(w) + string(c), clusterCost, 0, 0})
+					}
+				}
+			}
+		}
+	}
 	for _, p := range pairs {
-		rules = append(rules, rule{p.a, p.b, p.c}, rule{p.b, p.a, p.c})
+		rules = append(rules, rule{p.a, p.b, p.c, 0, 0}, rule{p.b, p.a, p.c, 0, 0})
 		maxRuleDict = max(maxRuleDict, len(p.a), len(p.b))
+	}
+	for i := range rules {
+		r := &rules[i]
+		for k := 0; k < len(r.dict); k++ {
+			r.dk = r.dk<<5 | uint64(code[r.dict[k]])
+		}
+		r.mask = 1<<(5*len(r.dict)) - 1
 	}
 	rulePrefix = make([]int32, 1<<(5*(maxRuleDict-1)))
 	for _, r := range rules {
@@ -280,7 +363,7 @@ func omitCost(path []byte, j int) int32 {
 	case path[j-1] == d: // doubled letter written once
 		c = 40
 	case d == '\'':
-		c = 30
+		c = aposCost
 	case isVowel(d) || d == 'h':
 		c = 70
 	}
@@ -299,7 +382,7 @@ func insCost(t []byte, i int) (c, insFat int32) {
 	case i >= 2 && t[i-2] == x: // letter doubled by mistake
 		c = 40
 	case x == '\'':
-		c = 30
+		c = aposCost
 	case isVowel(x) || x == 'h':
 		c = 70
 	}
@@ -388,7 +471,86 @@ func phonKey(w string) string {
 	return string(k)
 }
 
+// soundKey keeps vowel sounds, unlike phonKey: hand-written grapheme rules map
+// spellings of one sound (ee/ea, oa, o-consonant-e, ...) to one symbol, so
+// "wead" matches "weed" but not "wed". Lowercase = short vowel, uppercase = long.
+var soundRules = []struct {
+	g, s string
+	end  bool // rule applies only at the end of the word
+}{
+	{"tion", "SHN", false}, {"sion", "SHN", false}, {"cian", "SHN", false}, {"ough", "O", false},
+	{"augh", "O", false}, {"eigh", "A", false}, {"igh", "Y", false}, {"tch", "C", false},
+	{"sch", "SK", false}, {"ph", "F", false}, {"gh", "", false}, {"ck", "K", false},
+	{"qu", "KW", false}, {"wh", "W", false}, {"wr", "R", false}, {"kn", "N", false},
+	{"gn", "N", false}, {"mb", "M", true}, {"ee", "I", false}, {"ea", "I", false},
+	{"ie", "Y", true}, {"ie", "I", false}, {"ei", "I", false}, {"ey", "I", true},
+	{"oa", "O", false}, {"oe", "O", false}, {"ow", "O", true}, {"ou", "W", false},
+	{"ow", "W", false}, {"oo", "U", false}, {"ew", "U", false}, {"ue", "U", false},
+	{"ui", "U", false}, {"ai", "A", false}, {"ay", "A", false}, {"au", "O", false},
+	{"aw", "O", false}, {"oi", "E", false}, {"oy", "E", false}, {"ar", "AR", false},
+	{"er", "R", false}, {"ir", "R", false}, {"ur", "R", false}, {"or", "OR", false},
+	{"ch", "C", false}, {"sh", "X", false}, {"th", "0", false},
+}
+
+// consonant sounds for soundKey (arrays, not maps: soundKey runs for every word at startup)
+var consSound, softSound [256]string
+
+func init() {
+	for c, s := range map[byte]string{'c': "K", 'k': "K", 'q': "K", 'x': "KS", 'z': "S", 's': "S", 'j': "J",
+		'g': "G", 'd': "D", 't': "T", 'b': "B", 'p': "P", 'f': "F", 'v': "V", 'w': "W",
+		'h': "H", 'l': "L", 'm': "M", 'n': "N", 'r': "R"} {
+		consSound[c] = s
+	}
+	softSound['c'], softSound['g'] = "S", "J"
+}
+
+func soundKey(w string) string {
+	w = strings.ReplaceAll(w, "'", "")
+	n := len(w)
+	var k []byte
+	put := func(s string) {
+		for i := 0; i < len(s); i++ {
+			if len(k) == 0 || k[len(k)-1] != s[i] {
+				k = append(k, s[i])
+			}
+		}
+	}
+outer:
+	for i := 0; i < n; {
+		for _, r := range soundRules {
+			if r.g[0] == w[i] && strings.HasPrefix(w[i:], r.g) && (!r.end || i+len(r.g) == n) {
+				put(r.s)
+				i += len(r.g)
+				continue outer
+			}
+		}
+		c := w[i]
+		switch {
+		case isVowel(c) || c == 'y':
+			switch {
+			case i+2 == n-1 && w[n-1] == 'e' && !isVowel(w[i+1]): // magic e: vowel, consonant, final e
+				put(string("AIYOUY"[strings.IndexByte("aeiouy", c)]))
+			case c == 'e' && i == n-1 && n > 2: // silent final e
+			case c == 'y' && i == 0:
+				put("j")
+			case c == 'y':
+				put("i")
+			default:
+				put(string(c))
+			}
+		case (c == 'c' || c == 'g') && i+1 < n && strings.IndexByte("eiy", w[i+1]) >= 0:
+			put(softSound[c])
+		default:
+			put(consSound[c])
+		}
+		i++
+	}
+	return string(k)
+}
+
 // ---- search ----------------------------------------------------------------
+
+var directMax = 400 // most bonus candidates scored directly before the trie search
 
 const (
 	maxDepth  = 64
@@ -401,12 +563,15 @@ type searcher struct {
 	rowMin   [maxDepth + 1]int32
 	ins, fat [maxDepth + 1]int32 // insCost per typo position
 	path     [maxDepth + 1]byte
-	rmatch   [][]int32 // rmatch[i]: indices of rules whose typo side ends at typo position i
+	pk       [maxDepth + 1]uint64 // pk[j]: path[1..j] packed like rule.dk (letters beyond 12 shift out)
+	rmatch   [][28][]int32        // rmatch[i][c]: rules whose typo side ends at typo position i and dict side ends in letter code c
 	bound    int32
-	best     int32 // total (edit + prior) of bestWord
+	best     int32 // total score of bestWord
 	bestEdit int32
 	bestWord int32
 	key      string // phonetic key of the input
+	skey     string // sound key of the input
+	allow    int32  // bonus a not-yet-scored word may still get (0 once bonus words are scored directly)
 }
 
 func newSearcher() *searcher {
@@ -432,12 +597,14 @@ func (s *searcher) correct(w string) string {
 	n := len(t)
 	s.t = t
 	s.key = phonKey(w)
+	s.skey = soundKey(w)
 	s.rmatch = s.rmatch[:0]
 	for i := 0; i <= n; i++ {
-		var m []int32
+		var m [28][]int32
 		for r, ru := range rules {
 			if l := len(ru.typo); l <= i && string(t[i-l:i]) == ru.typo {
-				m = append(m, int32(r))
+				c := code[ru.dict[len(ru.dict)-1]]
+				m[c] = append(m[c], int32(r))
 			}
 		}
 		s.rmatch = append(s.rmatch, m)
@@ -450,12 +617,26 @@ func (s *searcher) correct(w string) string {
 		s.ins[i], s.fat[i] = insCost(t, i)
 		row[i] = row[i-1] + s.ins[i]
 	}
-	// a cheap tight pass first finds a good incumbent, so the full pass prunes harder
 	s.best, s.bestEdit, s.bestWord = math.MaxInt32, math.MaxInt32, -1
+	// Only words whose keys equal the input's can get a bonus. When there are few,
+	// score them directly first; the trie search then needs no bonus allowance,
+	// which makes its pruning much tighter.
+	s.allow = phoneBonus + soundBonus
+	if ph, sd := byPhon[s.key], bySnd[s.skey]; len(ph)+len(sd) <= directMax {
+		s.bound = maxEdit
+		for _, w := range ph {
+			s.scoreWord(w)
+		}
+		for _, w := range sd {
+			s.scoreWord(w)
+		}
+		s.allow = 0
+	}
+	// a cheap tight pass first finds a good incumbent, so the full pass prunes harder
 	for _, b := range []int32{min32(firstPass, maxEdit), maxEdit} {
 		s.bound = b
 		if s.bestWord >= 0 {
-			s.bound = min32(b, s.best+phoneBonus) // a discounted word may cost up to phoneBonus more to edit
+			s.bound = min32(b, s.best+s.allow) // a discounted word may cost up to the allowance more to edit
 		}
 		for c := trie[0].first; c >= 0; c = trie[c].next {
 			s.dfs(c, 1)
@@ -467,14 +648,14 @@ func (s *searcher) correct(w string) string {
 	return words[s.bestWord]
 }
 
-func (s *searcher) dfs(nd int32, j int) {
-	if j > maxDepth-1 {
-		return
-	}
+// step computes DP row j for trie node nd (its letter is path[j]) and returns the row minimum.
+func (s *searcher) step(nd int32, j int) int32 {
 	t, n := s.t, len(s.t)
 	s.path[j] = trie[nd].ch
 	prev, row := s.rows[j-1], s.rows[j]
 	d := s.path[j]
+	s.pk[j] = s.pk[j-1]<<5 | uint64(code[d])
+	pk := s.pk[j]
 	omit := omitCost(s.path[:], j)
 	row[0] = prev[0] + omit
 	lo := row[0]
@@ -486,34 +667,73 @@ func (s *searcher) dfs(nd int32, j int) {
 		}
 		v = min32(v, prev[i]+omit)
 		ins := s.ins[i]
-		if sub[d][x] == 75 {
+		if near[d][x] {
 			ins = min32(ins, s.fat[i])
 		}
 		v = min32(v, row[i-1]+ins)
+		if i >= 2 && x == d && near[d][t[i-2]] {
+			v = min32(v, prev[i-2]+s.fat[i-1]) // stray key immediately before its intended neighbor
+		}
 		if i >= 2 && j >= 2 && s.path[j] == t[i-2] && s.path[j-1] == x && x != s.path[j] {
 			v = min32(v, s.rows[j-2][i-2]+transCost)
 		}
-		for _, r := range s.rmatch[i] {
+		for _, r := range s.rmatch[i][code[d]] {
 			ru := &rules[r]
-			if l := len(ru.dict); l <= j && string(s.path[j-l+1:j+1]) == ru.dict {
+			if l := len(ru.dict); l <= j && pk&ru.mask == ru.dk {
 				v = min32(v, s.rows[j-l][i-len(ru.typo)]+ru.cost)
 			}
 		}
 		row[i] = v
 		lo = min32(lo, v)
 	}
-	if w := trie[nd].word; w >= 0 && row[n] <= s.bound {
-		// ties go to the smaller edit, then the earlier word: independent of search order
-		tot := row[n] + prior[w]
-		if phon[w] == s.key {
-			tot -= phoneBonus
-		}
-		if tot < s.best || tot == s.best && (row[n] < s.bestEdit || row[n] == s.bestEdit && w < s.bestWord) {
-			s.best, s.bestEdit, s.bestWord = tot, row[n], w
-			s.bound = min32(s.bound, tot+phoneBonus) // priors >= 0, bonus <= phoneBonus: nothing costlier can win
-		}
-	}
 	s.rowMin[j] = lo
+	return lo
+}
+
+// consider scores word w at edit cost e; ties go to the smaller edit, then the
+// earlier word, so the result does not depend on search order.
+func (s *searcher) consider(w, e int32) {
+	tot := e + prior[w]
+	if multiPen > 0 && !withinOne(words[w], string(s.t)) {
+		tot += multiPen // nonnegative: existing branch-and-bound lower bounds remain valid
+	}
+	if phon[w] == s.key {
+		tot -= phoneBonus
+	}
+	if snd[w] == s.skey {
+		tot -= soundBonus
+	}
+	if tot < s.best || tot == s.best && (e < s.bestEdit || e == s.bestEdit && w < s.bestWord) {
+		s.best, s.bestEdit, s.bestWord = tot, e, w
+		s.bound = min32(s.bound, tot+s.allow) // priors >= 0: no word with a larger edit can win
+	}
+}
+
+// scoreWord scores one dictionary word directly by walking its own trie path.
+func (s *searcher) scoreWord(w int32) {
+	nd := int32(0)
+	word := words[w]
+	for k := 0; k < len(word); k++ {
+		c := trie[nd].first
+		for trie[c].ch != word[k] {
+			c = trie[c].next
+		}
+		nd = c
+		s.step(nd, k+1)
+	}
+	if e := s.rows[len(word)][len(s.t)]; e <= maxEdit {
+		s.consider(w, e)
+	}
+}
+
+func (s *searcher) dfs(nd int32, j int) {
+	if j > maxDepth-1 {
+		return
+	}
+	lo := s.step(nd, j)
+	if w, e := trie[nd].word, s.rows[j][len(s.t)]; w >= 0 && e <= s.bound {
+		s.consider(w, e)
+	}
 	// a rule whose dict side is under way can still jump from an earlier row;
 	// any word below costs at least lo plus the subtree's best prior
 	if j >= 1 {
@@ -526,7 +746,7 @@ func (s *searcher) dfs(nd int32, j int) {
 			lo = min32(lo, s.rowMin[j-k]+c)
 		}
 	}
-	if lo > s.bound || lo+trie[nd].minPrior-phoneBonus > s.best {
+	if lo > s.bound || lo+trie[nd].minPrior-s.allow > s.best {
 		return
 	}
 	for c := trie[nd].first; c >= 0; c = trie[c].next {
@@ -534,9 +754,35 @@ func (s *searcher) dfs(nd int32, j int) {
 	}
 }
 
+// withinOne recognizes one insertion, deletion, substitution, or adjacent swap.
+func withinOne(a, b string) bool {
+	if abs(len(a)-len(b)) > 1 {
+		return false
+	}
+	i := 0
+	for i < len(a) && i < len(b) && a[i] == b[i] {
+		i++
+	}
+	if i == len(a) || i == len(b) {
+		return true
+	}
+	switch {
+	case len(a) > len(b):
+		return a[i+1:] == b[i:]
+	case len(b) > len(a):
+		return a[i:] == b[i+1:]
+	default:
+		return a[i+1:] == b[i+1:] || i+1 < len(a) && a[i] == b[i+1] && a[i+1] == b[i] && a[i+2:] == b[i+2:]
+	}
+}
+
 func main() {
+	debug.SetGCPercent(-1) // short-lived process: memory stays far below the 4 GB limit, GC is pure overhead
 	load()
-	raw, _ := io.ReadAll(os.Stdin)
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		os.Exit(1) // incomplete input cannot produce a valid run
+	}
 	in := strings.Split(string(raw), "\n")
 	if len(in) > 0 && in[len(in)-1] == "" {
 		in = in[:len(in)-1] // trailing newline ends the last line, it does not start a new one

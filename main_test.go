@@ -1,12 +1,17 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
 
-func TestCorrect(t *testing.T) {
+func TestMain(m *testing.M) {
 	load()
+	os.Exit(m.Run())
+}
+
+func TestCorrect(t *testing.T) {
 	s := newSearcher()
 	for typo, want := range map[string]string{
 		"the": "the", "recieve": "receive", "teh": "the", "dont": "don't", "acommodate": "accommodate",
@@ -29,6 +34,20 @@ func TestCorrect(t *testing.T) {
 			if got := s.correct(w); got != ref[k] {
 				t.Errorf("firstPass=%d: correct(%q) = %q, want %q", fp, w, got, ref[k])
 			}
+		}
+	}
+}
+
+func TestSoundKey(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		same bool
+	}{
+		{"see", "sea", true}, {"oat", "ote", true},
+		{"tape", "tap", false}, {"meet", "met", false},
+	} {
+		if got := soundKey(c.a) == soundKey(c.b); got != c.same {
+			t.Errorf("soundKey(%q)=%q, soundKey(%q)=%q; equal want %t", c.a, soundKey(c.a), c.b, soundKey(c.b), c.same)
 		}
 	}
 }
